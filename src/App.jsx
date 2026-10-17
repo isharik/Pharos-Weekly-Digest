@@ -84,7 +84,7 @@ const PHAROS_NETWORKS = {
       'https://explorer.pharos.xyz/api/v2'
     ],
     symbol: 'PROS',
-    explorer: 'https://scan.pharos.xyz'
+    explorer: 'https://www.pharosscan.xyz/'
   }
 };
 
