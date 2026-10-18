@@ -4,6 +4,10 @@
 
 A scheduled digest that summarizes a wallet's or protocol's on-chain activity and highlights what changed during the reporting period.
 
+## Video Walkthrough for getting started
+https://youtu.be/kkbNdTOeoUs
+
+
 ## Overview
 
 Weekly Digest Agent turns on-chain activity into a concise, recurring update. It compares key metrics with the previous period, surfaces the three most notable events, and delivers the digest through a supported channel or published page.
@@ -109,8 +113,6 @@ Available metrics and event detection depend on the configured data source. Do n
 
 ## License
 
-Add the license used by this repository.
+Not yet Approved by the team !
 
 
-* Video Walkthrough for getting started
-https://youtu.be/kkbNdTOeoUs
