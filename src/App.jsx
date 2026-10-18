@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, useId } from 'react';
 import {
   LayoutGrid,
   BookOpenCheck,
@@ -35,7 +35,6 @@ import {
   Cpu,
   AlertCircle,
   Info,
-  Code2,
   FolderGit2,
   Loader2,
   ChevronRight,
@@ -157,7 +156,7 @@ function doGet(e) {
 // 2. REUSABLE OFFICIAL PHAROS GEOMETRIC RIBBON LOGO COMPONENT
 // ============================================================================
 export function PharosLogo({ className = 'w-7 h-7 rounded-lg' }) {
-  const uniqueId = useMemo(() => `pharosFoldGrad_${Math.random().toString(36).slice(2, 8)}`, []);
+  const uniqueId = `pharosFoldGrad_${useId().replaceAll(':', '')}`;
   return (
     <svg
       viewBox="0 0 100 100"
@@ -218,7 +217,7 @@ function formatTokenAmount(num, maxDecimals = 4) {
   });
 }
 
-function computePoPDelta(currentVal, prevVal) {
+function computeSampleDelta(currentVal, prevVal) {
   if (prevVal === 0 && currentVal === 0) return '0.0';
   if (prevVal === 0 && currentVal > 0) return '100.0';
   return (((currentVal - prevVal) / prevVal) * 100).toFixed(1);
@@ -294,7 +293,7 @@ export default function App() {
   const [connectedAccount, setConnectedAccount] = useState(null);
   const [walletModalOpen, setWalletModalOpen] = useState(false);
 
-  // Requirement 01: Autonomous Schedule State (Weekly by default, configurable)
+  // Schedule configuration is local UI state; execution requires an external scheduler.
   const [scheduleEnabled, setScheduleEnabled] = useState(true);
   const [frequency, setFrequency] = useState('weekly'); // 'weekly' | 'daily' | 'biweekly'
   const [deliveryDay, setDeliveryDay] = useState('Monday');
@@ -335,7 +334,7 @@ export default function App() {
   });
   const [brevoApiKey, setBrevoApiKey] = useState(() => {
     try {
-      return localStorage.getItem('pharos_brevo_key') || '';
+      return sessionStorage.getItem('pharos_brevo_key') || '';
     } catch {
       return '';
     }
@@ -355,6 +354,7 @@ export default function App() {
   // Toast Notifications
   const [toasts, setToasts] = useState([]);
   const networkMenuRef = useRef(null);
+  const rpcRequestIdRef = useRef(0);
 
   const currentNetwork = PHAROS_NETWORKS[networkKey] || PHAROS_NETWORKS.atlantic;
 
@@ -417,8 +417,9 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem('pharos_gas_url', gasWebhookUrl.trim());
-      localStorage.setItem('pharos_brevo_key', brevoApiKey.trim());
-    } catch (_) {}
+      localStorage.removeItem('pharos_brevo_key');
+      sessionStorage.setItem('pharos_brevo_key', brevoApiKey.trim());
+    } catch {}
   }, [gasWebhookUrl, brevoApiKey]);
 
   // Close Network Dropdown on outside click
@@ -444,20 +445,20 @@ export default function App() {
       return {
         cron: `${Number(mm)} ${Number(hh)} * * *`,
         countdown: `Daily · ${deliveryTimeUtc} UTC`,
-        windowLabel: '24h PoP Window'
+        windowLabel: 'Configured daily cadence'
       };
     }
     if (frequency === 'biweekly') {
       return {
-        cron: `${Number(mm)} ${Number(hh)} */14 * ${dNum}`,
+        cron: `Every 14 days · ${deliveryDay} ${deliveryTimeUtc} UTC`,
         countdown: `Bi-Weekly · ${deliveryDay.slice(0, 3)} ${deliveryTimeUtc} UTC`,
-        windowLabel: '14d PoP Window'
+        windowLabel: 'Configured 14-day cadence'
       };
     }
     return {
       cron: `${Number(mm)} ${Number(hh)} * * ${dNum}`,
       countdown: `Every ${deliveryDay.slice(0, 3)} · ${deliveryTimeUtc} UTC`,
-      windowLabel: '7d PoP Window'
+      windowLabel: 'Configured weekly cadence'
     };
   }, [frequency, deliveryDay, deliveryTimeUtc]);
 
@@ -466,27 +467,32 @@ export default function App() {
   // ============================================================================
   const callPharosRpc = useCallback(
     async (method, params = [], net = currentNetwork, silentLog = false) => {
-      const startTime = performance.now();
-      const payload = {
-        jsonrpc: '2.0',
-        id: Date.now() + Math.floor(Math.random() * 1000),
-        method,
-        params
-      };
-
       for (const url of net.rpcUrls) {
+        const requestId = ++rpcRequestIdRef.current;
+        const payload = { jsonrpc: '2.0', id: requestId, method, params };
+        const startTime = performance.now();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
         try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000);
           const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
             signal: controller.signal
           });
-          clearTimeout(timeoutId);
-          if (!response.ok) continue;
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const data = await response.json();
+          if (data?.jsonrpc !== '2.0' || data?.id !== requestId) {
+            throw new Error('Invalid JSON-RPC response: version or request ID mismatch');
+          }
+          if (data.error) {
+            const error = new Error(data.error.message || 'JSON-RPC request failed');
+            error.code = data.error.code;
+            throw error;
+          }
+          if (!Object.prototype.hasOwnProperty.call(data, 'result')) {
+            throw new Error('Invalid JSON-RPC response: missing result');
+          }
           const elapsed = Math.max(1, Math.round(performance.now() - startTime));
 
           if (!silentLog) {
@@ -500,17 +506,15 @@ export default function App() {
                 result:
                   typeof data.result === 'object' && data.result !== null
                     ? JSON.stringify(data.result).slice(0, 220) + '...'
-                    : JSON.stringify(data.result ?? data),
+                    : JSON.stringify(data.result),
                 latencyMs: elapsed,
-                ok: data.result !== undefined
+                ok: true
               },
               ...prev.slice(0, 35)
             ]);
           }
 
-          if (data && data.result !== undefined) {
-            return { result: data.result, latencyMs: elapsed, endpoint: url };
-          }
+          return { result: data.result, latencyMs: elapsed, endpoint: url };
         } catch (err) {
           if (!silentLog) {
             setRpcLogs((prev) => [
@@ -520,16 +524,18 @@ export default function App() {
                 endpoint: url,
                 method,
                 params: JSON.stringify(params),
-                result: JSON.stringify({ error: err.message }),
+                result: JSON.stringify({ error: err.message, code: err.code }),
                 latencyMs: 0,
                 ok: false
               },
               ...prev.slice(0, 35)
             ]);
           }
+        } finally {
+          clearTimeout(timeoutId);
         }
       }
-      return { result: null, latencyMs: 0, endpoint: net.rpcUrls[0] };
+      return { result: null, latencyMs: 0, endpoint: net.rpcUrls[0], error: 'All RPC endpoints failed' };
     },
     [currentNetwork]
   );
@@ -578,7 +584,7 @@ export default function App() {
             };
           });
         }
-      } catch (_) {}
+      } catch {}
     }
     return [];
   }, []);
@@ -705,10 +711,28 @@ export default function App() {
       setIsSyncingRpc(true);
       setCustomAiSummary(null);
 
-      const [blockRes, gasRes] = await Promise.all([
+      const [chainRes, blockRes, gasRes] = await Promise.all([
+        callPharosRpc('eth_chainId', [], net),
         callPharosRpc('eth_blockNumber', [], net),
         callPharosRpc('eth_gasPrice', [], net)
       ]);
+
+      if (
+        typeof chainRes.result !== 'string' ||
+        chainRes.result.toLowerCase() !== net.chainIdHex.toLowerCase()
+      ) {
+        setLiveRpcState((previous) => ({ ...previous, rpcConnected: false }));
+        setDataSourceLabel(
+          chainRes.result
+            ? `Wrong chain · expected ${net.chainIdHex}, received ${chainRes.result}`
+            : 'RPC unavailable · all configured endpoints failed'
+        );
+        setIsSyncingRpc(false);
+        if (triggerType === 'manual') {
+          showToast('Could not verify the selected Pharos network. Check RPC availability.', 'error');
+        }
+        return;
+      }
 
       const latestBlock =
         blockRes.result && typeof blockRes.result === 'string'
@@ -852,19 +876,19 @@ export default function App() {
 
     const currVolume = sumVolume(currPeriodTxs);
     const prevVolume = sumVolume(prevPeriodTxs);
-    const volDeltaPct = computePoPDelta(currVolume, prevVolume);
+    const volDeltaPct = computeSampleDelta(currVolume, prevVolume);
 
     const currTxCount = currPeriodTxs.length;
     const prevTxCount = prevPeriodTxs.length;
-    const txDeltaPct = computePoPDelta(currTxCount, prevTxCount);
+    const txDeltaPct = computeSampleDelta(currTxCount, prevTxCount);
 
     const currUsers = countUniqueCounterparties(currPeriodTxs);
     const prevUsers = countUniqueCounterparties(prevPeriodTxs);
-    const usersDeltaPct = computePoPDelta(currUsers, prevUsers);
+    const usersDeltaPct = computeSampleDelta(currUsers, prevUsers);
 
     const currGas = sumGas(currPeriodTxs);
     const prevGas = sumGas(prevPeriodTxs);
-    const gasDeltaPct = computePoPDelta(currGas, prevGas);
+    const gasDeltaPct = computeSampleDelta(currGas, prevGas);
 
     const currentSeries = [0, 0, 0, 0, 0, 0, 0];
     const prevSeries = [0, 0, 0, 0, 0, 0, 0];
@@ -878,14 +902,6 @@ export default function App() {
         const bucket = idx % 7;
         prevSeries[bucket] += tx.valueFloat > 0 ? tx.valueFloat : 1;
       });
-    } else if (scannedBlocks.length > 0) {
-      scannedBlocks
-        .slice(0, 7)
-        .reverse()
-        .forEach((blk, idx) => {
-          currentSeries[idx] = blk.txCount;
-          prevSeries[idx] = Math.max(0, Math.round(blk.txCount * 0.85));
-        });
     }
 
     const rankedTxs = [...txsToAnalyze].sort((a, b) => {
@@ -938,10 +954,10 @@ export default function App() {
               : 'EOA Wallet'
           }). Across ${
             txsToAnalyze.length
-          } indexed period transactions, settled volume is ${formatTokenAmount(
+          } indexed transactions in the fetched sample, volume is ${formatTokenAmount(
             currVolume,
             4
-          )} ${sym} (${Number(volDeltaPct) >= 0 ? '+' : ''}${volDeltaPct}% PoP) across ${currTxCount} txs (${
+          )} ${sym} (${Number(volDeltaPct) >= 0 ? '+' : ''}${volDeltaPct}% sample delta) across ${currTxCount} txs (
             Number(txDeltaPct) >= 0 ? '+' : ''
           }${txDeltaPct}%) and ${currUsers} counterparties.`
         : `On ${currentNetwork.name} (Block #${bHeight.toLocaleString()}), ${targetLabel} (${shortAddr}) holds ${
@@ -998,7 +1014,6 @@ export default function App() {
     targetAddress,
     targetLabel,
     realTransactions,
-    scannedBlocks,
     frequency,
     customAiSummary
   ]);
@@ -1013,7 +1028,7 @@ export default function App() {
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
     const systemPrompt =
       'You are the Pharos Network Weekly Digest Agent (ai.pharos.xyz). Write a concise, 2-sentence institutional telemetry summary strictly using the real onchain metrics provided.';
-    const userQuery = `Network: ${d.networkName} (Block #${d.blockNumber}). Address: ${d.subjectLabel} (${d.subjectAddress}). Balance: ${liveRpcState.balanceFormatted} ${d.symbol}. Nonce: ${liveRpcState.txCount}. Period Volume: ${d.metrics.volume.currentFormatted} ${d.symbol} (${d.metrics.volume.deltaPct}% PoP). Period Txs: ${d.metrics.txCount.current}. Counterparties: ${d.metrics.users.current}. Gas: ${d.metrics.gas.currentFormatted} ${d.symbol}.`;
+    const userQuery = `Network: ${d.networkName} (Block #${d.blockNumber}). Address: ${d.subjectLabel} (${d.subjectAddress}). Balance: ${liveRpcState.balanceFormatted} ${d.symbol}. Nonce: ${liveRpcState.txCount}. Fetched sample volume: ${d.metrics.volume.currentFormatted} ${d.symbol} (${d.metrics.volume.deltaPct}% sample delta). Sample transactions: ${d.metrics.txCount.current}. Counterparties: ${d.metrics.users.current}. Sample gas fees: ${d.metrics.gas.currentFormatted} ${d.symbol}.`;
 
     try {
       const res = await fetch(apiUrl, {
@@ -1031,7 +1046,7 @@ export default function App() {
       } else {
         throw new Error('Fallback');
       }
-    } catch (_) {
+    } catch {
       setCustomAiSummary(
         `AI Telemetry Synthesis (Block #${d.blockNumber.toLocaleString()}): ${
           d.subjectLabel
@@ -1039,11 +1054,11 @@ export default function App() {
           liveRpcState.balanceFormatted
         } ${d.symbol} with ${liveRpcState.txCount.toLocaleString()} cumulative onchain transactions. Across ${
           d.totalAnalyzedTxs
-        } indexed period transactions, settled volume reached ${d.metrics.volume.currentFormatted} ${
+        } indexed transactions in the fetched sample, volume was ${d.metrics.volume.currentFormatted} ${
           d.symbol
         } (${Number(d.metrics.volume.deltaPct) >= 0 ? '+' : ''}${
           d.metrics.volume.deltaPct
-        }% PoP) across ${d.metrics.users.current} unique counterparties and ${
+              }% sample delta) across ${d.metrics.users.current} unique counterparties and ${
           d.metrics.gas.currentFormatted
         } ${d.symbol} in gas fees (${liveRpcState.gasPriceGwei} Gwei base fee).`
       );
@@ -1092,7 +1107,7 @@ export default function App() {
           method: 'wallet_switchEthereumChain',
           params: [{ chainId: net.chainIdHex }]
         });
-      } catch (_) {
+      } catch {
         try {
           await window.ethereum.request({
             method: 'wallet_addEthereumChain',
@@ -1106,7 +1121,7 @@ export default function App() {
               }
             ]
           });
-        } catch (__) {}
+        } catch {}
       }
     }
     await executeLiveDigestRun('network-switch', '', net, 'Discovered Onchain Entity');
@@ -1145,7 +1160,7 @@ export default function App() {
       `• Settled Volume: ${d.metrics.volume.currentFormatted} ${d.symbol} (${d.metrics.volume.deltaPct}% vs ${d.metrics.volume.prevFormatted} prev)`,
       `• Transactions Executed: ${d.metrics.txCount.current} (${d.metrics.txCount.deltaPct}% vs ${d.metrics.txCount.prev} prev)`,
       `• Unique Counterparties: ${d.metrics.users.current} (${d.metrics.users.deltaPct}% vs ${d.metrics.users.prev} prev)`,
-      `• Gas Consumed: ${d.metrics.gas.currentFormatted} ${d.symbol} (${d.metrics.gas.deltaPct}% vs ${d.metrics.gas.prevFormatted} prev)`,
+      `• Sample gas fees: ${d.metrics.gas.currentFormatted} ${d.symbol} (${d.metrics.gas.deltaPct}% sample delta vs ${d.metrics.gas.prevFormatted})`,
       ``,
       `03. TOP 3 NOTABLE ONCHAIN EVENTS OF THE PERIOD`,
       ...eventsLines
@@ -1207,13 +1222,13 @@ export default function App() {
               <strong>From:</strong> Pharos Weekly Digest Agent &lt;${OFFICIAL_SENDER_EMAIL}&gt;<br/>
               <strong>To:</strong> ${recipientEmail}<br/>
               <strong>Live RPC Balance:</strong> ${liveRpcState.balanceFormatted} ${d.symbol} (Nonce: ${liveRpcState.txCount})<br/>
-              <strong>Schedule:</strong> ${frequency.toUpperCase()} (${scheduleMeta.cron}) · ${timestamp}
+              <strong>Configured cadence:</strong> ${frequency.toUpperCase()} (${scheduleMeta.cron}) · ${timestamp}
             </div>
             <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:#64748B;margin:0 0 6px;">01 · Executive Summary</h3>
             <p style="font-size:12px;line-height:1.55;color:#1E293B;background:#F8FAFC;padding:12px 14px;border-radius:10px;border:1px solid #E2E8F0;margin:0 0 16px;">
               ${d.executiveText}
             </p>
-            <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:#64748B;margin:0 0 8px;">02 · Period-over-Period Key Metrics</h3>
+            <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:#64748B;margin:0 0 8px;">02 · Fetched Sample Comparison</h3>
             <table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:18px;">
               <thead>
                 <tr style="background:#F1F5F9;text-align:left;color:#475569;">
@@ -1253,7 +1268,7 @@ export default function App() {
                   }${d.metrics.users.deltaPct}%</td>
                 </tr>
                 <tr>
-                  <td style="padding:8px 10px;font-family:sans-serif;font-weight:600;">Gas Consumed</td>
+                  <td style="padding:8px 10px;font-family:sans-serif;font-weight:600;">Sample Gas Fees</td>
                   <td style="padding:8px 10px;font-weight:700;">${d.metrics.gas.currentFormatted} ${
         d.symbol
       }</td>
@@ -1420,6 +1435,7 @@ export default function App() {
     let transportNote = 'Option B Relay';
     let serverMessage = '';
     let deliveredWithoutActivation = false;
+    let deliveryOutcomeUnknown = false;
 
     if (customGasUrl && gasCheck.valid) {
       const gasPayload = JSON.stringify({
@@ -1439,30 +1455,20 @@ export default function App() {
           body: gasPayload
         });
         const gasJson = await gasRes.json().catch(() => null);
-        if (gasJson && gasJson.ok === false) {
-          throw new Error(gasJson.error || 'Apps Script returned ok:false');
+        if (!gasRes.ok || gasJson?.ok !== true) {
+          throw new Error(gasJson?.error || `Apps Script returned HTTP ${gasRes.status} without ok:true`);
         }
         deliveredWithoutActivation = true;
         transportNote = 'HTTP 200 Sent (Gmail Script)';
         serverMessage = `HTTP 200 Sent via Gmail Relay (${OFFICIAL_SENDER_EMAIL} → ${recipient}).`;
-      } catch (_) {
-        try {
-          await fetch(customGasUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: gasPayload
-          });
-          deliveredWithoutActivation = true;
-          transportNote = 'HTTP 200 Sent (Gmail Script)';
-          serverMessage = `HTTP 200 Sent via Gmail Relay (${OFFICIAL_SENDER_EMAIL} → ${recipient}).`;
-        } catch (finalErr) {
-          serverMessage = `Gmail Apps Script error: ${finalErr.message}`;
-        }
+      } catch (err) {
+        deliveryOutcomeUnknown = true;
+        transportNote = 'Gmail Relay Outcome Unknown';
+        serverMessage = `The relay response could not be confirmed (${err.message}). The request may have reached the relay; check its execution log before retrying to avoid duplicate email.`;
       }
     }
 
-    if (!deliveredWithoutActivation && brevoKey) {
+    if (!deliveredWithoutActivation && !deliveryOutcomeUnknown && brevoKey) {
       try {
         const brevoRes = await fetch('https://api.brevo.com/v3/smtp/email', {
           method: 'POST',
@@ -1493,7 +1499,7 @@ export default function App() {
       }
     }
 
-    if (!deliveredWithoutActivation) {
+    if (!deliveredWithoutActivation && !deliveryOutcomeUnknown) {
       const relayPayload = {
         _subject: subjectLine,
         sender: `Pharos Weekly Digest Agent <${OFFICIAL_SENDER_EMAIL}>`,
@@ -1504,10 +1510,10 @@ export default function App() {
         block_number: `#${d.blockNumber.toLocaleString()}`,
         live_rpc_balance: `${liveRpcState.balanceFormatted} ${d.symbol}`,
         executive_summary: d.executiveText,
-        settled_volume: `${d.metrics.volume.currentFormatted} ${d.symbol} (${d.metrics.volume.deltaPct}% PoP)`,
-        transactions_executed: `${d.metrics.txCount.current} (${d.metrics.txCount.deltaPct}% PoP)`,
-        unique_counterparties: `${d.metrics.users.current} (${d.metrics.users.deltaPct}% PoP)`,
-        gas_consumed: `${d.metrics.gas.currentFormatted} ${d.symbol} (${d.metrics.gas.deltaPct}% PoP)`,
+        settled_volume: `${d.metrics.volume.currentFormatted} ${d.symbol} (${d.metrics.volume.deltaPct}% sample delta)`,
+        transactions_executed: `${d.metrics.txCount.current} (${d.metrics.txCount.deltaPct}% sample delta)`,
+        unique_counterparties: `${d.metrics.users.current} (${d.metrics.users.deltaPct}% sample delta)`,
+        gas_consumed: `${d.metrics.gas.currentFormatted} ${d.symbol} (${d.metrics.gas.deltaPct}% sample delta)`,
         _template: 'table',
         _captcha: 'false'
       };
@@ -1529,7 +1535,7 @@ export default function App() {
             ? `FormSubmit requires activation ("${res.message}"). Click "30-Sec Setup Wizard" to connect your Google Apps Script /exec URL for instant delivery.`
             : `Connect the 30-Second Gmail Apps Script Relay (${OFFICIAL_SENDER_EMAIL}) for zero-activation delivery.`;
         }
-      } catch (_) {
+      } catch {
         transportNote = 'Awaiting Option B URL';
         serverMessage = `Click "30-Sec Setup Wizard" to paste your Google Apps Script /exec URL for ${OFFICIAL_SENDER_EMAIL}.`;
       }
@@ -1565,8 +1571,10 @@ export default function App() {
     showToast(
       deliveredWithoutActivation
         ? `Sent from ${OFFICIAL_SENDER_EMAIL} to ${recipient}!`
-        : 'Connect Option B Gmail Script /exec URL for instant delivery',
-      deliveredWithoutActivation ? 'success' : 'info'
+        : deliveryOutcomeUnknown
+          ? 'Email outcome is unknown. Check relay logs before retrying.'
+          : 'Connect Option B Gmail Script /exec URL for instant delivery',
+      deliveredWithoutActivation ? 'success' : deliveryOutcomeUnknown ? 'error' : 'info'
     );
   };
 
@@ -2070,11 +2078,11 @@ export default function App() {
                         REQ 01
                       </span>
                       <span className={`text-[10px] font-semibold uppercase tracking-wider ${t.textMuted}`}>
-                        Scheduler
+                        Schedule setup
                       </span>
                     </div>
                     <h2 className={`text-sm font-semibold mt-0.5 ${t.textPrimary}`}>
-                      Periodic Execution Cadence
+                      Digest cadence
                     </h2>
                   </div>
 
@@ -2083,7 +2091,7 @@ export default function App() {
                     onClick={() => {
                       setScheduleEnabled((v) => !v);
                       showToast(
-                        !scheduleEnabled ? 'Weekly Schedule enabled' : 'Schedule paused',
+                        !scheduleEnabled ? 'Digest schedule enabled' : 'Digest schedule paused',
                         'info'
                       );
                     }}
@@ -2104,8 +2112,8 @@ export default function App() {
                   <div className="grid grid-cols-3 gap-2">
                     {[
                       { id: 'weekly', title: 'Weekly', sub: 'Default · 7d' },
-                      { id: 'daily', title: 'Daily', sub: '24h PoP' },
-                      { id: 'biweekly', title: 'Bi-Weekly', sub: '14d PoP' }
+                      { id: 'daily', title: 'Daily', sub: '24h cadence' },
+                      { id: 'biweekly', title: 'Bi-Weekly', sub: '14d cadence' }
                     ].map((item) => (
                       <button
                         key={item.id}
@@ -2163,6 +2171,9 @@ export default function App() {
                     {scheduleMeta.cron}
                   </span>
                 </div>
+                <p className={`text-[10px] leading-relaxed ${t.textMuted}`}>
+                  Configuration only. An external scheduler is required to run and deliver reports automatically.
+                </p>
               </div>
             </div>
           )}
@@ -2176,7 +2187,7 @@ export default function App() {
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5">
                 {[
                   {
-                    label: 'Settled Volume',
+                    label: 'Sample volume',
                     value: `${digestData.metrics.volume.currentFormatted} ${digestData.symbol}`,
                     delta: digestData.metrics.volume.deltaPct,
                     prev: `${digestData.metrics.volume.prevFormatted} prev`,
@@ -2184,7 +2195,7 @@ export default function App() {
                     icon: ArrowUpRight
                   },
                   {
-                    label: 'Period Transactions',
+                    label: 'Sample transactions',
                     value: digestData.metrics.txCount.current,
                     delta: digestData.metrics.txCount.deltaPct,
                     prev: `${digestData.metrics.txCount.prev} prev`,
@@ -2200,7 +2211,7 @@ export default function App() {
                     icon: Users
                   },
                   {
-                    label: 'Gas Consumed',
+                    label: 'Sample gas fees',
                     value: `${digestData.metrics.gas.currentFormatted} ${digestData.symbol}`,
                     delta: digestData.metrics.gas.deltaPct,
                     prev: `${digestData.metrics.gas.prevFormatted} prev`,
@@ -2381,7 +2392,7 @@ export default function App() {
                     REQ 03
                   </span>
                   <h3 className={`text-sm font-semibold ${t.textPrimary}`}>
-                    Top 3 Notable Onchain Events of the Period
+                    Top 3 Notable Events in the Fetched Sample
                   </h3>
                   <span className={`text-xs hidden sm:inline ${t.textMuted}`}>
                     — Ranked by real value &amp; gas on {currentNetwork.name}
@@ -2691,7 +2702,7 @@ export default function App() {
                               Discord Webhook Embed Dispatch
                             </div>
                             <div className={`text-[10px] ${t.textMuted}`}>
-                              Posts rich embed with live balance, PoP deltas &amp; Top 3 Events
+                              Posts a digest with live balance, sample comparisons &amp; Top 3 Events
                             </div>
                           </div>
                         </div>
@@ -2953,15 +2964,15 @@ export default function App() {
 
                 <div className="space-y-2">
                   <h2 className={`text-[11px] font-bold uppercase tracking-wider ${t.textMuted}`}>
-                    02 · Key Metrics vs. Previous Period
+                    02 · Fetched sample comparison
                   </h2>
                   <div className={`overflow-hidden rounded-lg border ${t.divider}`}>
                     <table className="w-full text-left border-collapse text-xs">
                       <thead>
                         <tr className={`border-b ${t.subcard} ${t.divider} ${t.textSecondary}`}>
                           <th className="py-2.5 px-4 font-semibold">Metric</th>
-                          <th className="py-2.5 px-4 font-semibold">Current Period</th>
-                          <th className="py-2.5 px-4 font-semibold">Previous Period</th>
+                          <th className="py-2.5 px-4 font-semibold">Later sample half</th>
+                          <th className="py-2.5 px-4 font-semibold">Earlier sample half</th>
                           <th className="py-2.5 px-4 font-semibold text-right">Delta</th>
                         </tr>
                       </thead>
@@ -3013,7 +3024,7 @@ export default function App() {
                         </tr>
                         <tr>
                           <td className={`py-2.5 px-4 font-sans font-medium ${t.textPrimary}`}>
-                            Gas Consumed ({digestData.symbol})
+                            Sample gas fees ({digestData.symbol})
                           </td>
                           <td className={`py-2.5 px-4 font-semibold ${t.textPrimary}`}>
                             {digestData.metrics.gas.currentFormatted} {digestData.symbol}
@@ -3448,9 +3459,11 @@ export default function App() {
                   </div>
                 </div>
 
-                <div
-                  className="rounded-lg border border-slate-200 bg-white p-3"
-                  dangerouslySetInnerHTML={{ __html: lastEmailReceipt.htmlBody }}
+                <iframe
+                  title="Email receipt preview"
+                  sandbox=""
+                  srcDoc={lastEmailReceipt.htmlBody}
+                  className="w-full h-72 rounded-lg border border-slate-200 bg-white"
                 />
               </div>
 
@@ -3496,7 +3509,7 @@ export default function App() {
                       ai.pharos.xyz Submission &amp; Deployment Checklist
                     </h3>
                     <p className={`text-[11px] ${t.textMuted}`}>
-                      All 4 Weekly Digest Agent requirements verified
+                    Feature checklist. Automatic runs require an external scheduler.
                     </p>
                   </div>
                 </div>
@@ -3511,7 +3524,7 @@ export default function App() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
                 {[
                   { id: '01', title: 'Configurable Schedule', desc: 'Weekly default (0 9 * * 1), Daily & Bi-Weekly' },
-                  { id: '02', title: 'PoP Key Metrics', desc: 'Volume, Txs, Counterparties & Gas with deltas' },
+                  { id: '02', title: 'Fetched Sample Metrics', desc: 'Volume, transactions, counterparties and gas comparison' },
                   { id: '03', title: 'Top 3 Notable Events', desc: 'Ranked onchain txs with PharosScan links' },
                   { id: '04', title: 'Real Channel Delivery', desc: 'Email (echoplex19120@gmail.com), Discord, Telegram & Report' }
                 ].map((req) => (
@@ -3520,7 +3533,7 @@ export default function App() {
                       <span className={t.textPrimary}>
                         {req.id} · {req.title}
                       </span>
-                      <span className="text-emerald-500 font-mono text-[10px]">PASS ✓</span>
+                      <span className="text-slate-500 font-mono text-[10px]">AVAILABLE</span>
                     </div>
                     <p className={`text-[11px] ${t.textMuted}`}>{req.desc}</p>
                   </div>

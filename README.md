@@ -2,117 +2,54 @@
 
 # Weekly Digest Agent
 
-A scheduled digest that summarizes a wallet's or protocol's on-chain activity and highlights what changed during the reporting period.
+A React and Vite dashboard for reading Pharos EVM network state, inspecting a fetched transaction sample, composing a digest, and sending it through configured delivery channels.
 
-## Video Walkthrough for getting started
-https://youtu.be/kkbNdTOeoUs
+## Video walkthrough
 
+[Watch the getting started walkthrough](https://youtu.be/kkbNdTOeoUs)
 
-## Overview
+## Run locally
 
-Weekly Digest Agent turns on-chain activity into a concise, recurring update. It compares key metrics with the previous period, surfaces the three most notable events, and delivers the digest through a supported channel or published page.
-
-## Features
-
-- Configurable schedule, with weekly reporting as the default.
-- Supports a wallet or protocol as the reporting subject.
-- Reports key metrics for the current period.
-- Compares metrics with the previous period.
-- Highlights the top three notable events.
-- Delivers output through email, Telegram, Discord, or a published page, depending on configured integrations.
-
-## Reporting Workflow
-
-1. Configure the target wallet or protocol and reporting period.
-2. Collect activity and calculate the selected metrics.
-3. Compare the current period with the previous equivalent period.
-4. Rank and summarize notable events.
-5. Generate the digest and deliver it through the configured destination.
-6. Record delivery status so failures can be diagnosed.
-
-## Example Digest
-
-```markdown
-# Weekly On-chain Digest
-
-- Subject: <wallet or protocol>
-- Period: <start date> to <end date>
-- Previous period: <start date> to <end date>
-
-## Key Metrics
-
-| Metric | Current Period | Previous Period | Change |
-|---|---:|---:|---:|
-| Transactions | — | — | — |
-| Volume | — | — | — |
-| Active addresses | — | — | — |
-
-## Top 3 Events
-
-1. <Event summary and evidence link>
-2. <Event summary and evidence link>
-3. <Event summary and evidence link>
+```sh
+npm install
+npm run dev
+npm run lint
+npm run build
 ```
 
-This is a format example only; populate it with metrics supported by the implementation.
+## Network access
 
-## Setup
+The browser UI reads chain data through EVM JSON-RPC (`eth_chainId`, `eth_blockNumber`, `eth_gasPrice`, `eth_getBlockByNumber`, `eth_getBalance`, `eth_getTransactionCount`, and `eth_getCode`). It checks that the responding RPC chain ID matches the selected network before displaying a sync as connected. Network endpoints and chain settings are defined in `src/App.jsx`.
 
-Clone the repository:
+The configured explorer API retrieves address transaction history, with recent-block JSON-RPC scanning as a fallback. Explorer availability, endpoint CORS policy, and public RPC rate limits can affect data coverage. The UI reports a fetched sample; it does not index a complete weekly history or calculate true calendar-period comparisons.
 
-```bash
-git clone <YOUR_REPOSITORY_URL>
-cd <REPOSITORY_DIRECTORY>
+## Pharos MCP for agent clients
+
+The dashboard is a browser app and does not itself speak MCP. For an MCP-compatible IDE or agent, Pharos publishes a read-only Streamable HTTP server at `https://mcp.pharos.xyz/mcp`. Add this to that client's MCP server configuration:
+
+```json
+{
+  "mcpServers": {
+    "pharos": {
+      "type": "http",
+      "url": "https://mcp.pharos.xyz/mcp"
+    }
+  }
+}
 ```
 
-Install the project's dependencies using its package manager or dependency file. Configure the required data-provider and delivery-channel credentials through environment variables.
+The MCP server exposes chain information, blocks, balances, transaction lookups, code, logs, and other read tools. Its hosted transaction-broadcast tool is disabled. The dashboard's wallet actions use the injected EIP-1193 provider; digest reads use JSON-RPC. MCP is an agent-tool protocol, not a replacement for either browser API.
 
-Example configuration placeholders:
+## Features and limits
 
-```env
-# Reporting
-DIGEST_SCHEDULE=weekly
-DIGEST_TIMEZONE=UTC
+- Configure a wallet or protocol address and select a supported network.
+- Inspect live balance, nonce, block, gas price, recent transactions, and notable events.
+- Compare the earlier and later halves of the fetched sample. These are sample comparisons, not true period-over-period metrics.
+- Prepare a digest for email, Telegram, Discord, or a published report, depending on configured integrations.
+- Configure a desired cadence. The UI does not run a persistent scheduler; automatic execution requires an external scheduler and a deployed backend.
 
-# Data source
-# PHAROS_RPC_URL=
-# MCP configuration belongs in the project's supported config.
+Delivery integrations run from the browser and require user-provided webhook credentials or relay configuration. Treat browser-stored settings as accessible to anyone who can use that browser profile. The Brevo key is held in session storage. Do not use a production secret in the client. An email receipt records the provider response and is not independent proof of inbox delivery. Apps Script must be deployed and authorized before it can send mail.
 
-# Delivery: configure only the provider(s) used by this project
-# SMTP_HOST=
-# SMTP_USER=
-# SMTP_PASSWORD=
-# TELEGRAM_BOT_TOKEN=
-# DISCORD_WEBHOOK_URL=
-```
+## Validation
 
-Do not commit `.env` files or secrets. See the repository's actual configuration and startup command before running the agent.
-
-## Scheduling and Delivery
-
-Use the scheduler implemented by this project. If the schedule is managed externally (for example, by a deployment platform or cron), document that configuration here. Confirm the timezone and delivery destination before enabling recurring jobs.
-
-## Reliability
-
-- Store the reporting period associated with each digest.
-- Handle rate limits and temporary data-source failures.
-- Retry delivery failures safely and avoid duplicate messages.
-- Distinguish zero activity from unavailable data.
-- Include links or references for notable events.
-
-## Limitations
-
-Available metrics and event detection depend on the configured data source. Do not imply that a metric is supported unless the implementation calculates it reliably.
-
-## Roadmap
-
-- [ ] Add more configurable metrics
-- [ ] Improve event ranking
-- [ ] Add delivery-status logging
-- [ ] Add tests for period-over-period comparisons
-
-## License
-
-Not yet Approved by the team !
-
-
+Run `npm run lint` and `npm run build` to check the frontend. These checks do not verify live RPC, explorer, MCP, or delivery service availability.
