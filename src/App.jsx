@@ -293,11 +293,22 @@ export default function App() {
   const [connectedAccount, setConnectedAccount] = useState(null);
   const [walletModalOpen, setWalletModalOpen] = useState(false);
 
-  // Schedule configuration is local UI state; execution requires an external scheduler.
-  const [scheduleEnabled, setScheduleEnabled] = useState(true);
+  // Schedule and reporting are backed by the persistent Node scheduler API.
+  const [scheduleEnabled, setScheduleEnabled] = useState(false);
   const [frequency, setFrequency] = useState('weekly'); // 'weekly' | 'daily' | 'biweekly'
   const [deliveryDay, setDeliveryDay] = useState('Monday');
   const [deliveryTimeUtc, setDeliveryTimeUtc] = useState('09:00');
+  const [schedulerToken, setSchedulerToken] = useState(() => {
+    try {
+      return sessionStorage.getItem('pharos_scheduler_token') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [schedulerStatus, setSchedulerStatus] = useState(null);
+  const [schedulerReport, setSchedulerReport] = useState(null);
+  const [schedulerBusy, setSchedulerBusy] = useState(false);
+  const [schedulerMessage, setSchedulerMessage] = useState('');
 
   // Strict Real Onchain RPC State
   const [isSyncingRpc, setIsSyncingRpc] = useState(false);
@@ -412,6 +423,91 @@ export default function App() {
       setToasts((prev) => prev.filter((item) => item.id !== id));
     }, 3400);
   }, []);
+
+  const schedulerApi = useCallback(async (path, options = {}) => {
+    if (!schedulerToken.trim()) throw new Error('Enter the scheduler API token configured on the server.');
+    const apiBase = (import.meta.env.VITE_DIGEST_API_URL || '').replace(/\/+$/, '');
+    const response = await fetch(`${apiBase}${path}`, {
+      ...options,
+      headers: {
+        authorization: `Bearer ${schedulerToken.trim()}`,
+        ...(options.body ? { 'content-type': 'application/json' } : {}),
+        ...options.headers
+      }
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `Scheduler API returned HTTP ${response.status}.`);
+    return result;
+  }, [schedulerToken]);
+
+  const loadSchedulerStatus = useCallback(async () => {
+    const status = await schedulerApi('/api/status');
+    setSchedulerStatus(status);
+    const saved = status.schedule;
+    if (saved?.address) {
+      setScheduleEnabled(saved.enabled);
+      setFrequency(saved.frequency);
+      setDeliveryDay(saved.day);
+      setDeliveryTimeUtc(saved.time);
+      setNetworkKey(saved.network);
+      setAddressInput(saved.address);
+      setTargetAddress(saved.address);
+      setTargetLabel(saved.label || 'Scheduled Digest Target');
+      setEmailRecipient(saved.recipient || '');
+    }
+    if (status.lastRun?.status === 'accepted' && status.lastRun.report) {
+      setSchedulerReport(status.lastRun.report);
+    }
+    return status;
+  }, [schedulerApi]);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('pharos_scheduler_token', schedulerToken);
+    } catch {}
+  }, [schedulerToken]);
+
+  useEffect(() => {
+    if (!schedulerToken) return;
+    loadSchedulerStatus().catch((error) => setSchedulerMessage(error.message));
+  }, [schedulerToken, loadSchedulerStatus]);
+
+  const saveSchedulerConfiguration = async (runNow = false) => {
+    setSchedulerBusy(true);
+    setSchedulerMessage('');
+    try {
+      const saved = await schedulerApi('/api/schedule', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: scheduleEnabled,
+          network: networkKey,
+          address: (addressInput || targetAddress).trim(),
+          label: targetLabel,
+          recipient: emailRecipient.trim(),
+          frequency,
+          day: deliveryDay,
+          time: deliveryTimeUtc
+        })
+      });
+      setSchedulerStatus(saved);
+      if (runNow) {
+        const result = await schedulerApi('/api/run', { method: 'POST', body: '{}' });
+        setSchedulerReport(result.report);
+        await loadSchedulerStatus();
+        setSchedulerMessage(`Email accepted by SMTP at ${new Date(result.finishedAt).toLocaleString()}.`);
+        showToast('Period comparison emailed through the configured SMTP server.', 'success');
+      } else {
+        setSchedulerMessage(saved.schedule.enabled
+          ? `Schedule saved. Next run: ${new Date(saved.schedule.nextRunAt).toLocaleString()} UTC.`
+          : 'Schedule saved and paused.');
+      }
+    } catch (error) {
+      setSchedulerMessage(error.message);
+      showToast(error.message, 'error');
+    } finally {
+      setSchedulerBusy(false);
+    }
+  };
 
   // Persist Option B Relay Configuration
   useEffect(() => {
@@ -2090,11 +2186,9 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setScheduleEnabled((v) => !v);
-                      showToast(
-                        !scheduleEnabled ? 'Digest schedule enabled' : 'Digest schedule paused',
-                        'info'
-                      );
                     }}
+                    aria-label={scheduleEnabled ? 'Pause digest schedule' : 'Enable digest schedule'}
+                    aria-pressed={scheduleEnabled}
                     className={`w-9 h-5 rounded-full transition-colors p-0.5 shrink-0 ${
                       scheduleEnabled ? 'bg-emerald-500' : 'bg-slate-400 dark:bg-slate-700'
                     }`}
@@ -2171,9 +2265,51 @@ export default function App() {
                     {scheduleMeta.cron}
                   </span>
                 </div>
-                <p className={`text-[10px] leading-relaxed ${t.textMuted}`}>
-                  Configuration only. An external scheduler is required to run and deliver reports automatically.
-                </p>
+                <div className="space-y-2">
+                  <label className={`text-[10px] font-medium block ${t.textMuted}`} htmlFor="scheduler-api-token">
+                    Scheduler API token
+                  </label>
+                  <input
+                    id="scheduler-api-token"
+                    type="password"
+                    autoComplete="current-password"
+                    value={schedulerToken}
+                    onChange={(event) => setSchedulerToken(event.target.value)}
+                    placeholder="Set DIGEST_API_TOKEN on the backend"
+                    className={`w-full h-8 px-2.5 rounded-lg border text-[11px] font-mono focus:outline-none ${t.input}`}
+                  />
+                  <div className={`text-[10px] ${t.textMuted}`} role="status" aria-live="polite">
+                    {schedulerStatus
+                      ? `Scheduler API connected · SMTP ${schedulerStatus.emailConfigured ? 'configured' : 'missing'} · SocialScan history API ${schedulerStatus.historyConfigured ? 'configured' : 'missing'}`
+                      : schedulerMessage || 'Connect to the persistent scheduler and SMTP service.'}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => saveSchedulerConfiguration(false)}
+                      disabled={schedulerBusy}
+                      className={`h-8 px-3 rounded-lg text-xs font-medium ${t.btnSecondary} disabled:opacity-50`}
+                    >
+                      {schedulerBusy ? 'Saving…' : 'Save schedule'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => saveSchedulerConfiguration(true)}
+                      disabled={schedulerBusy}
+                      className="h-8 px-3 rounded-lg bg-[#001AE6] text-white text-xs font-medium disabled:opacity-50"
+                    >
+                      {schedulerBusy ? 'Sending…' : 'Run now & email'}
+                    </button>
+                  </div>
+                  {schedulerMessage && (
+                    <p className={`text-[10px] leading-relaxed ${t.textSecondary}`} role="status">{schedulerMessage}</p>
+                  )}
+                  {schedulerStatus?.schedule?.nextRunAt && schedulerStatus.schedule.enabled && (
+                    <p className={`text-[10px] ${t.textMuted}`}>
+                      Next run (UTC): {new Date(schedulerStatus.schedule.nextRunAt).toLocaleString('en-GB', { timeZone: 'UTC' })}
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -2253,6 +2389,58 @@ export default function App() {
                   );
                 })}
               </div>
+
+              {schedulerReport && (
+                <section className={`rounded-xl p-4 border space-y-3 ${t.card}`} aria-labelledby="calendar-comparison-title">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <h2 id="calendar-comparison-title" className={`text-sm font-semibold ${t.textPrimary}`}>
+                        {schedulerReport.frequency} period comparison
+                      </h2>
+                      <p className={`text-[10px] mt-1 ${t.textMuted}`}>
+                        {schedulerReport.networkName} · {schedulerReport.label} · fetched {schedulerReport.coverage.explorerPages} explorer page(s)
+                      </p>
+                    </div>
+                    <span className={`text-[10px] font-mono ${t.textMuted}`}>
+                      Generated {new Date(schedulerReport.generatedAt).toLocaleString()}
+                    </span>
+                  </div>
+                  <div className={`grid grid-cols-2 gap-2 text-[10px] font-mono ${t.textMuted}`}>
+                    <span>Current: {new Date(schedulerReport.window.currentFrom).toLocaleString()} – {new Date(schedulerReport.window.currentTo).toLocaleString()}</span>
+                    <span>Previous: {new Date(schedulerReport.window.previousFrom).toLocaleString()} – {new Date(schedulerReport.window.previousTo).toLocaleString()}</span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs min-w-[520px]">
+                      <thead>
+                        <tr className={`${t.textMuted} border-b ${t.divider}`}>
+                          <th className="py-2 pr-3">Metric</th>
+                          <th className="py-2 pr-3 text-right">Current</th>
+                          <th className="py-2 pr-3 text-right">Previous</th>
+                          <th className="py-2 text-right">Change</th>
+                        </tr>
+                      </thead>
+                      <tbody className={t.textPrimary}>
+                        {[
+                          ['Transactions', schedulerReport.comparison.current.transactionCount, schedulerReport.comparison.previous.transactionCount, schedulerReport.comparison.deltaPercent.transactionCount],
+                          [`Native volume (${schedulerReport.symbol})`, schedulerReport.comparison.current.volume, schedulerReport.comparison.previous.volume, schedulerReport.comparison.deltaPercent.volume],
+                          ['Unique counterparties', schedulerReport.comparison.current.counterparties, schedulerReport.comparison.previous.counterparties, schedulerReport.comparison.deltaPercent.counterparties],
+                          [`Fees (${schedulerReport.symbol})`, schedulerReport.comparison.current.fees ?? 'Unavailable', schedulerReport.comparison.previous.fees ?? 'Unavailable', schedulerReport.comparison.deltaPercent.fees]
+                        ].map(([label, current, previous, delta]) => (
+                          <tr key={label} className={`border-b last:border-0 ${t.divider}`}>
+                            <td className="py-2 pr-3">{label}</td>
+                            <td className="py-2 pr-3 text-right font-mono">{current}</td>
+                            <td className="py-2 pr-3 text-right font-mono">{previous}</td>
+                            <td className="py-2 text-right font-mono">{delta === null ? (String(label).startsWith('Fees') && (current === 'Unavailable' || previous === 'Unavailable') ? 'Unavailable' : 'New activity') : `${delta}%`}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className={`text-[10px] ${t.textMuted}`}>
+                    Source: SocialScan transaction history · Blocks {schedulerReport.coverage.blockRange.from}–{schedulerReport.coverage.blockRange.to} · Last emailed report.
+                  </div>
+                </section>
+              )}
 
               {/* Trajectory Chart + AI Executive Narrative (12-Col Compact Row) */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
@@ -2658,6 +2846,15 @@ export default function App() {
 
                       {/* Compact Action Buttons */}
                       <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => saveSchedulerConfiguration(true)}
+                          disabled={schedulerBusy || !schedulerToken}
+                          className="h-8 px-4 rounded-lg bg-[#001AE6] hover:bg-[#1028c7] text-white text-xs font-medium flex items-center gap-1.5 shadow-sm transition disabled:opacity-50"
+                        >
+                          <MailCheck className="w-3.5 h-3.5" />
+                          <span>{schedulerBusy ? 'Sending…' : 'Run & Email via SMTP'}</span>
+                        </button>
                         <button
                           onClick={() => handleDeliverToEmail(false, false)}
                           disabled={isSendingEmail}
